@@ -4,15 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Web 框架与异步运行时
 axum = "0.7.5"
 tokio = { version = "1.38", features = ["full"] }
-
-# 序列化与反序列化
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
-
-# 🌟 核心修复：升级到 0.12 版本，完美对齐 axum 0.7 的 http 1.x 标准
 reqwest = { version = "0.12", features = ["json", "stream"] }
 bytes = "1.6"

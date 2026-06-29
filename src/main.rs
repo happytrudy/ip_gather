@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BinaryHeap, HashMap},
     cmp::Ordering,
+    env,
     fs,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -48,7 +49,7 @@ struct ExpireNode {
 }
 impl Ord for ExpireNode {
     fn cmp(&self, other: &Self) -> Ordering {
-        other.expire_at.cmp(&self.expire_at) // 反转，使最早过期的在堆顶
+        other.expire_at.cmp(&self.expire_at)
     }
 }
 impl PartialOrd for ExpireNode {
@@ -57,13 +58,11 @@ impl PartialOrd for ExpireNode {
     }
 }
 
-// 异步通道传递的消息类型
 enum RegistryCmd {
     Register(String, u64), 
     ClearAll,              
 }
 
-// 全局状态无锁共享上下文
 struct AppContext {
     config: AppConfig,
     tx: mpsc::Sender<RegistryCmd>,
@@ -72,8 +71,28 @@ struct AppContext {
 
 #[tokio::main]
 async fn main() {
-    let config_str = fs::read_to_string("config.toml").expect("无法读取 config.toml");
-    let config: AppConfig = toml::from_str(&config_str).expect("解析 config.toml 失败");
+    // 🌟 核心改进：解析命令行参数以支持自定义配置文件路径
+    let args: Vec<String> = env::args().collect();
+    let mut config_path = "config.toml".to_string(); // 默认路径
+
+    let mut i = 1;
+    while i < args.len() {
+        if (args[i] == "-c" || args[i] == "--config") && i + 1 < args.len() {
+            config_path = args[i + 1].clone();
+            break;
+        }
+        i += 1;
+    }
+
+    println!("📖 [配置加载] 正在尝试从路径读取配置: {}", config_path);
+
+    // 读取并解析 TOML 配置文件
+    let config_str = fs::read_to_string(&config_path)
+        .unwrap_or_else(|_| panic!("❌ 错误：无法在 [{}] 找到有效的配置文件，请检查路径是否正确", config_path));
+        
+    let config: AppConfig = toml::from_str(&config_str)
+        .expect("❌ 错误：解析配置文件失败，请检查 TOML 语法格式是否正确");
+
     let listen_addr = config.listen_address.clone();
     let json_path = config.json_path.clone();
     
@@ -85,10 +104,10 @@ async fn main() {
 
     // 初始化全局唯一的复用 HTTP 客户端
     let http_client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none()) // 显式禁止自动跟随重定向，透传给浏览器
-        .pool_max_idle_per_host(20)                  // 增加闲置连接池复用率
-        .connect_timeout(Duration::from_secs(3))     // 3秒连不上伪装站直接断开，防挂起
-        .timeout(Duration::from_secs(10))            // 请求最长10秒
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(20)
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(10))
         .build()
         .unwrap();
 
@@ -98,14 +117,13 @@ async fn main() {
         http_client,
     });
 
-    // 路由，任何其他路径无条件落入高保真镜像反代
     let app = Router::new()
         .route("/ip/:secret/:user", get(report_ip_handler))
         .route("/system/:clear_secret/:target", get(clear_ip_handler))
         .fallback(any(proxy_to_fake_handler)) 
         .with_state(shared_context); 
 
-    println!("🏆 [毫无遗憾·宇宙终极版] 服务完全体启动成功！监听: {}", listen_addr);
+    println!("🏆 [毫无遗憾·支持传参版] 服务启动成功！监听: {}", listen_addr);
     let listener = tokio::net::TcpListener::bind(listen_addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
@@ -134,7 +152,6 @@ async fn registry_center_loop(json_path: String, mut rx: mpsc::Receiver<Registry
                         db.expires.insert(cidr.clone(), expire_at);
                         
                         if db.rules.is_empty() { db.rules.push(SingBoxRule::default()); }
-                        // 🌟 修复：db.rules 是一个 Vec，需要通过 [0] 访问它里面的具体规则对象
                         let ip_list = &mut db.rules[0].source_ip_cidr;
                         if !ip_list.contains(&cidr) {
                             ip_list.push(cidr.clone());
@@ -145,7 +162,6 @@ async fn registry_center_loop(json_path: String, mut rx: mpsc::Receiver<Registry
                     }
                     RegistryCmd::ClearAll => {
                         db.expires.clear();
-                        // 🌟 修复：同上，数组清空需要正确定位到 [0]
                         if !db.rules.is_empty() { db.rules[0].source_ip_cidr.clear(); }
                         heap.clear();
                         save_config(&json_path, &db);
@@ -163,7 +179,6 @@ async fn registry_center_loop(json_path: String, mut rx: mpsc::Receiver<Registry
                             if let Some(&real_expire) = db.expires.get(&expired_node.cidr) {
                                 if now >= real_expire {
                                     db.expires.remove(&expired_node.cidr);
-                                    // 🌟 修复：同上，移除操作精确到第 [0] 个 rules 元素
                                     if !db.rules.is_empty() {
                                         db.rules[0].source_ip_cidr.retain(|x| x != &expired_node.cidr);
                                     }
@@ -242,7 +257,6 @@ async fn clear_ip_handler(
         let _ = ctx.tx.send(RegistryCmd::ClearAll).await;
     }
 
-    // 🌟 修复：将 Redirect::found 改为 axum 认可的标准 Redirect::temporary
     Redirect::temporary(&format!("{}/", ctx.config.fake_website)).into_response()
 }
 
@@ -271,7 +285,6 @@ async fn proxy_to_fake(
 
     headers.remove("host"); 
     
-    // 🌟 修复：得益于 reqwest 0.12 升级，这里的 Method 和 HeaderMap 格式已完美天然互通
     let mut req_builder = ctx.http_client.request(method, &target_url).headers(headers);
     if let Some(b) = body { if !b.is_empty() { req_builder = req_builder.body(b); } }
 
@@ -280,7 +293,6 @@ async fn proxy_to_fake(
             let mut resp_builder = Response::builder().status(res.status().as_u16());
             for (key, value) in res.headers().iter() {
                 if key != "server" && key != "cf-ray" { 
-                    // 🌟 修复：利用 .clone()，完美将新版 reqwest HeaderValue 转为 axum HeaderValue
                     resp_builder = resp_builder.header(key.as_str(), value.clone()); 
                 }
             }
