@@ -11,12 +11,13 @@ use std::{
     cmp::Ordering,
     env,
     fs,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc;
 
-// 映射 config.toml 的结构体
+// 映射 config.toml 的数据结构
 #[derive(Deserialize, Clone)]
 struct AppConfig {
     secret_key: String,
@@ -27,7 +28,7 @@ struct AppConfig {
     expiration_hours: u64,
 }
 
-// 扩展 sing-box 结构，带上过期的注册对照表
+// 专门给 sing-box 看的纯净规则集结构体
 #[derive(Serialize, Deserialize, Clone, Default)]
 struct SingBoxRule {
     source_ip_cidr: Vec<String>,
@@ -37,7 +38,11 @@ struct SingBoxRule {
 struct SingBoxConfig {
     version: u32,
     rules: Vec<SingBoxRule>,
-    #[serde(default)]
+}
+
+// 专门给 Rust 后端内部持久化、防重启丢失用的状态结构体
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct RustRegistryState {
     expires: HashMap<String, u64>,
 }
 
@@ -58,11 +63,13 @@ impl PartialOrd for ExpireNode {
     }
 }
 
+// 异步通信通道指令类型
 enum RegistryCmd {
     Register(String, u64), 
     ClearAll,              
 }
 
+// 全局状态无锁共享上下文
 struct AppContext {
     config: AppConfig,
     tx: mpsc::Sender<RegistryCmd>,
@@ -71,38 +78,47 @@ struct AppContext {
 
 #[tokio::main]
 async fn main() {
-    // 🌟 核心改进：解析命令行参数以支持自定义配置文件路径
+    // 1. 解析命令行参数以支持自定义配置文件路径 (-c / --config)
     let args: Vec<String> = env::args().collect();
-    let mut config_path = "config.toml".to_string(); // 默认路径
+    let mut config_path_str = "config.toml".to_string(); // 默认寻找当前目录
 
     let mut i = 1;
     while i < args.len() {
         if (args[i] == "-c" || args[i] == "--config") && i + 1 < args.len() {
-            config_path = args[i + 1].clone();
+            config_path_str = args[i + 1].clone();
             break;
         }
         i += 1;
     }
 
-    println!("📖 [配置加载] 正在尝试从路径读取配置: {}", config_path);
+    println!("📖 [配置加载] 正在尝试从路径读取配置: {}", config_path_str);
 
-    // 读取并解析 TOML 配置文件
-    let config_str = fs::read_to_string(&config_path)
-        .unwrap_or_else(|_| panic!("❌ 错误：无法在 [{}] 找到有效的配置文件，请检查路径是否正确", config_path));
+    let config_str = fs::read_to_string(&config_path_str)
+        .unwrap_or_else(|_| panic!("❌ 错误：无法在 [{}] 找到有效的配置文件，请检查路径是否正确", config_path_str));
         
     let config: AppConfig = toml::from_str(&config_str)
-        .expect("❌ 错误：解析配置文件失败，请检查 TOML 语法格式是否正确");
+        .expect("❌ 错误：解析配置文件失败，请检查 TOML 语法格式");
 
     let listen_addr = config.listen_address.clone();
     let json_path = config.json_path.clone();
     
-    // 初始化异步通道
+    // 🌟 计算 config 文件的同级目录路径，用来存放 .db 状态文件
+    let config_path_buf = PathBuf::from(&config_path_str);
+    let mut db_path_buf = if let Some(parent) = config_path_buf.parent() {
+        parent.to_path_buf()
+    } else {
+        PathBuf::from(".")
+    };
+    db_path_buf.push("ip_whitelist.json.db"); // 固定在 config 同级目录下生成该状态文件
+    let db_path_str = db_path_buf.to_string_lossy().into_owned();
+
+    // 2. 初始化全异步无锁 MPSC 通道
     let (tx, rx) = mpsc::channel::<RegistryCmd>(256);
     
-    // 启动后台单线程注册中心任务
-    tokio::spawn(registry_center_loop(json_path, rx));
+    // 3. 🚀 启动后台单线程注册中心任务（把计算好的 db_path_str 传给它）
+    tokio::spawn(registry_center_loop(json_path, db_path_str, rx));
 
-    // 初始化全局唯一的复用 HTTP 客户端
+    // 4. 初始化全局唯一的复用高并发 HTTP 客户端
     let http_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(20)
@@ -117,28 +133,35 @@ async fn main() {
         http_client,
     });
 
+    // 5. 组装异步 Web 路由
     let app = Router::new()
         .route("/ip/:secret/:user", get(report_ip_handler))
         .route("/system/:clear_secret/:target", get(clear_ip_handler))
-        .fallback(any(proxy_to_fake_handler)) 
+        .fallback(any(proxy_to_fake_handler))
         .with_state(shared_context); 
 
-    println!("🏆 [毫无遗憾·支持传参版] 服务启动成功！监听: {}", listen_addr);
+    println!("🏆 [完美分家+DB路径对齐版] 服务启动成功！监听: {}", listen_addr);
     let listener = tokio::net::TcpListener::bind(listen_addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
+// 获取当前系统独有的 UNIX 时间戳(秒)
 fn current_timestamp() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
-// 注册中心常驻任务
-async fn registry_center_loop(json_path: String, mut rx: mpsc::Receiver<RegistryCmd>) {
-    let mut db = load_config(&json_path);
+// 🛡️ 注册中心常驻任务
+async fn registry_center_loop(json_path: String, db_path: String, mut rx: mpsc::Receiver<RegistryCmd>) {
+    let mut sb_config = load_singbox_config(&json_path);
+    let mut rust_state = load_rust_state(&db_path);
+    
+    // 初始化小根堆，将历史状态中的到期倒计时无缝恢复回内存中
     let mut heap = BinaryHeap::new();
-    for (cidr, &expire_at) in db.expires.iter() {
+    for (cidr, &expire_at) in rust_state.expires.iter() {
         heap.push(ExpireNode { cidr: cidr.clone(), expire_at });
     }
+    println!("📦 [注册中心] 状态文件加载路径: {}", db_path);
+    println!("📦 [注册中心] 白名单当前存活历史 IP 数: {}", sb_config.rules.first().map(|r| r.source_ip_cidr.len()).unwrap_or(0));
 
     let mut is_dirty = false;
     let mut ticker = tokio::time::interval(Duration::from_secs(2));
@@ -149,10 +172,13 @@ async fn registry_center_loop(json_path: String, mut rx: mpsc::Receiver<Registry
                 match cmd {
                     RegistryCmd::Register(cidr, duration_secs) => {
                         let expire_at = current_timestamp() + duration_secs;
-                        db.expires.insert(cidr.clone(), expire_at);
                         
-                        if db.rules.is_empty() { db.rules.push(SingBoxRule::default()); }
-                        let ip_list = &mut db.rules[0].source_ip_cidr;
+                        // 1. 压入 Rust 私有数据库状态
+                        rust_state.expires.insert(cidr.clone(), expire_at);
+                        
+                        // 2. 压入绝对纯净、供 sing-box 正常读取的结构体
+                        if sb_config.rules.is_empty() { sb_config.rules.push(SingBoxRule::default()); }
+                        let ip_list = &mut sb_config.rules.source_ip_cidr;
                         if !ip_list.contains(&cidr) {
                             ip_list.push(cidr.clone());
                         }
@@ -161,10 +187,11 @@ async fn registry_center_loop(json_path: String, mut rx: mpsc::Receiver<Registry
                         is_dirty = true;
                     }
                     RegistryCmd::ClearAll => {
-                        db.expires.clear();
-                        if !db.rules.is_empty() { db.rules[0].source_ip_cidr.clear(); }
+                        rust_state.expires.clear();
+                        if !sb_config.rules.is_empty() { sb_config.rules.source_ip_cidr.clear(); }
                         heap.clear();
-                        save_config(&json_path, &db);
+                        
+                        save_configs(&json_path, &db_path, &sb_config, &rust_state);
                         is_dirty = false;
                     }
                 }
@@ -176,14 +203,17 @@ async fn registry_center_loop(json_path: String, mut rx: mpsc::Receiver<Registry
                 while let Some(node) = heap.peek() {
                     if now >= node.expire_at {
                         if let Some(expired_node) = heap.pop() {
-                            if let Some(&real_expire) = db.expires.get(&expired_node.cidr) {
+                            if let Some(&real_expire) = rust_state.expires.get(&expired_node.cidr) {
                                 if now >= real_expire {
-                                    db.expires.remove(&expired_node.cidr);
-                                    if !db.rules.is_empty() {
-                                        db.rules[0].source_ip_cidr.retain(|x| x != &expired_node.cidr);
+                                    // 1. 从 Rust 私有状态释放
+                                    rust_state.expires.remove(&expired_node.cidr);
+                                    
+                                    // 2. 从纯净的 sing-box 白名单中安全剔除
+                                    if !sb_config.rules.is_empty() {
+                                        sb_config.rules.source_ip_cidr.retain(|x| x != &expired_node.cidr);
                                     }
                                     has_expired = true;
-                                    println!("⏱️ [自动销毁] IP {} 授权过期，注册中心安全移除。", expired_node.cidr);
+                                    println!("⏱️ [自动销毁] IP {} 授权已满，注册中心成功将其从白名单中安全剥离。", expired_node.cidr);
                                 }
                             }
                         }
@@ -193,7 +223,7 @@ async fn registry_center_loop(json_path: String, mut rx: mpsc::Receiver<Registry
                 }
 
                 if has_expired || is_dirty {
-                    save_config(&json_path, &db);
+                    save_configs(&json_path, &db_path, &sb_config, &rust_state);
                     is_dirty = false;
                 }
             }
@@ -201,21 +231,43 @@ async fn registry_center_loop(json_path: String, mut rx: mpsc::Receiver<Registry
     }
 }
 
-fn load_config(path: &str) -> SingBoxConfig {
+// 辅助文件读取：sing-box 白名单文件
+fn load_singbox_config(path: &str) -> SingBoxConfig {
     match fs::read_to_string(path) {
         Ok(content) => serde_json::from_str::<SingBoxConfig>(&content).unwrap_or_else(|_| SingBoxConfig {
-            version: 1, rules: vec![SingBoxRule::default()], expires: HashMap::new()
+            version: 1, rules: vec![SingBoxRule::default()]
         }),
-        Err(_) => SingBoxConfig { version: 1, rules: vec![SingBoxRule::default()], expires: HashMap::new() }
+        Err(_) => SingBoxConfig { version: 1, rules: vec![SingBoxRule::default()] }
     }
 }
-fn save_config(path: &str, config: &SingBoxConfig) {
-    if let Some(parent) = std::path::Path::new(path).parent() { let _ = fs::create_dir_all(parent); }
-    let json_str = serde_json::to_string_pretty(config).unwrap();
-    let _ = fs::write(path, json_str);
+
+// 辅助文件读取：Rust 持久化时间戳状态
+fn load_rust_state(path: &str) -> RustRegistryState {
+    match fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str::<RustRegistryState>(&content).unwrap_or_else(|_| RustRegistryState {
+            expires: HashMap::new()
+        }),
+        Err(_) => RustRegistryState { expires: HashMap::new() }
+    }
 }
 
-// 1️⃣ 接口：客户端上报 IP
+// 辅助数据双写落盘
+fn save_configs(json_path: &str, db_path: &str, sb_config: &SingBoxConfig, rust_state: &RustRegistryState) {
+    // 自动创建 sing-box json 的父目录
+    if let Some(parent) = std::path::Path::new(json_path).parent() { let _ = fs::create_dir_all(parent); }
+    // 自动创建 rust db 的父目录（通常 config 目录已存在，但双保险保留）
+    if let Some(parent) = std::path::Path::new(db_path).parent() { let _ = fs::create_dir_all(parent); }
+    
+    // 🌟 文件一：专门给 sing-box 自动热重载使用的纯净格式 [1.31]
+    let sb_json = serde_json::to_string_pretty(sb_config).unwrap();
+    let _ = fs::write(json_path, sb_json);
+
+    // 🌟 文件二：固定存放在 config 的同级目录下，用于 Rust 防重启状态恢复
+    let rust_json = serde_json::to_string_pretty(rust_state).unwrap();
+    let _ = fs::write(db_path, rust_json);
+}
+
+// 1️⃣ 接口：客户端上报注册 IP
 async fn report_ip_handler(
     State(ctx): State<Arc<AppContext>>,
     Path((secret, _user)): Path<(String, String)>,
@@ -241,6 +293,10 @@ async fn report_ip_handler(
         .body(axum::body::Body::from(format!("{}\n", client_ip)))
         .unwrap()
 }
+
+
+
+
 
 // 2️⃣ 接口：一键清理白名单
 async fn clear_ip_handler(
