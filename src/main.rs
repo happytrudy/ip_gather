@@ -102,7 +102,7 @@ async fn main() {
     let listen_addr = config.listen_address.clone();
     let json_path = config.json_path.clone();
     
-    // 🌟 计算 config 文件的同级目录路径，用来存放 .db 状态文件
+    // 计算 config 文件的同级目录路径，用来存放 .db 状态文件
     let config_path_buf = PathBuf::from(&config_path_str);
     let mut db_path_buf = if let Some(parent) = config_path_buf.parent() {
         parent.to_path_buf()
@@ -178,7 +178,8 @@ async fn registry_center_loop(json_path: String, db_path: String, mut rx: mpsc::
                         
                         // 2. 压入绝对纯净、供 sing-box 正常读取的结构体
                         if sb_config.rules.is_empty() { sb_config.rules.push(SingBoxRule::default()); }
-                        let ip_list = &mut sb_config.rules.source_ip_cidr;
+                        // 🌟 核心修复 1：通过 [0] 索引访问 Vec 数组内的规则对象
+                        let ip_list = &mut sb_config.rules[0].source_ip_cidr;
                         if !ip_list.contains(&cidr) {
                             ip_list.push(cidr.clone());
                         }
@@ -188,7 +189,8 @@ async fn registry_center_loop(json_path: String, db_path: String, mut rx: mpsc::
                     }
                     RegistryCmd::ClearAll => {
                         rust_state.expires.clear();
-                        if !sb_config.rules.is_empty() { sb_config.rules.source_ip_cidr.clear(); }
+                        // 🌟 核心修复 2：通过 [0] 索引访问 Vec 数组内对象并清空
+                        if !sb_config.rules.is_empty() { sb_config.rules[0].source_ip_cidr.clear(); }
                         heap.clear();
                         
                         save_configs(&json_path, &db_path, &sb_config, &rust_state);
@@ -209,8 +211,9 @@ async fn registry_center_loop(json_path: String, db_path: String, mut rx: mpsc::
                                     rust_state.expires.remove(&expired_node.cidr);
                                     
                                     // 2. 从纯净的 sing-box 白名单中安全剔除
+                                    // 🌟 核心修复 3：通过 [0] 索引安全调用数组的 retain 过滤
                                     if !sb_config.rules.is_empty() {
-                                        sb_config.rules.source_ip_cidr.retain(|x| x != &expired_node.cidr);
+                                        sb_config.rules[0].source_ip_cidr.retain(|x| x != &expired_node.cidr);
                                     }
                                     has_expired = true;
                                     println!("⏱️ [自动销毁] IP {} 授权已满，注册中心成功将其从白名单中安全剥离。", expired_node.cidr);
@@ -253,16 +256,12 @@ fn load_rust_state(path: &str) -> RustRegistryState {
 
 // 辅助数据双写落盘
 fn save_configs(json_path: &str, db_path: &str, sb_config: &SingBoxConfig, rust_state: &RustRegistryState) {
-    // 自动创建 sing-box json 的父目录
     if let Some(parent) = std::path::Path::new(json_path).parent() { let _ = fs::create_dir_all(parent); }
-    // 自动创建 rust db 的父目录（通常 config 目录已存在，但双保险保留）
     if let Some(parent) = std::path::Path::new(db_path).parent() { let _ = fs::create_dir_all(parent); }
     
-    // 🌟 文件一：专门给 sing-box 自动热重载使用的纯净格式 [1.31]
     let sb_json = serde_json::to_string_pretty(sb_config).unwrap();
     let _ = fs::write(json_path, sb_json);
 
-    // 🌟 文件二：固定存放在 config 的同级目录下，用于 Rust 防重启状态恢复
     let rust_json = serde_json::to_string_pretty(rust_state).unwrap();
     let _ = fs::write(db_path, rust_json);
 }
