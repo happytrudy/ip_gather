@@ -8,11 +8,11 @@ edition = "2021"
 axum = "0.7.5"
 tokio = { version = "1.38", features = ["full"] }
 
-# 序列化与反序列化（支持 JSON 和 TOML）
+# 序列化与反序列化
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 
-# 异步 HTTP 客户端（用于无缝反向代理伪装网站）
-reqwest = { version = "0.11", features = ["json", "stream"] }
+# 🌟 核心修复：升级到 0.12 版本，完美对齐 axum 0.7 的 http 1.x 标准
+reqwest = { version = "0.12", features = ["json", "stream"] }
 bytes = "1.6"

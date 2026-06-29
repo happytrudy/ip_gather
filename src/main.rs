@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State, Request},
+    extract::{Path, State},
     http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Redirect, Response},
     routing::{any, get},
@@ -98,11 +98,11 @@ async fn main() {
         http_client,
     });
 
-    // 🌟 路由大升级：匹配所有路由，保留完整 URI 路径传递
+    // 路由，任何其他路径无条件落入高保真镜像反代
     let app = Router::new()
         .route("/ip/:secret/:user", get(report_ip_handler))
         .route("/system/:clear_secret/:target", get(clear_ip_handler))
-        .fallback(any(proxy_to_fake_handler)) // 任何其他路径无条件落入高保真镜像反代
+        .fallback(any(proxy_to_fake_handler)) 
         .with_state(shared_context); 
 
     println!("🏆 [毫无遗憾·宇宙终极版] 服务完全体启动成功！监听: {}", listen_addr);
@@ -114,7 +114,7 @@ fn current_timestamp() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
-// 注册中心常驻任务（算法与防抖趋于完美，免检）
+// 注册中心常驻任务
 async fn registry_center_loop(json_path: String, mut rx: mpsc::Receiver<RegistryCmd>) {
     let mut db = load_config(&json_path);
     let mut heap = BinaryHeap::new();
@@ -134,7 +134,8 @@ async fn registry_center_loop(json_path: String, mut rx: mpsc::Receiver<Registry
                         db.expires.insert(cidr.clone(), expire_at);
                         
                         if db.rules.is_empty() { db.rules.push(SingBoxRule::default()); }
-                        let ip_list = &mut db.rules.source_ip_cidr;
+                        // 🌟 修复：db.rules 是一个 Vec，需要通过 [0] 访问它里面的具体规则对象
+                        let ip_list = &mut db.rules[0].source_ip_cidr;
                         if !ip_list.contains(&cidr) {
                             ip_list.push(cidr.clone());
                         }
@@ -144,7 +145,8 @@ async fn registry_center_loop(json_path: String, mut rx: mpsc::Receiver<Registry
                     }
                     RegistryCmd::ClearAll => {
                         db.expires.clear();
-                        if !db.rules.is_empty() { db.rules.source_ip_cidr.clear(); }
+                        // 🌟 修复：同上，数组清空需要正确定位到 [0]
+                        if !db.rules.is_empty() { db.rules[0].source_ip_cidr.clear(); }
                         heap.clear();
                         save_config(&json_path, &db);
                         is_dirty = false;
@@ -161,8 +163,9 @@ async fn registry_center_loop(json_path: String, mut rx: mpsc::Receiver<Registry
                             if let Some(&real_expire) = db.expires.get(&expired_node.cidr) {
                                 if now >= real_expire {
                                     db.expires.remove(&expired_node.cidr);
+                                    // 🌟 修复：同上，移除操作精确到第 [0] 个 rules 元素
                                     if !db.rules.is_empty() {
-                                        db.rules.source_ip_cidr.retain(|x| x != &expired_node.cidr);
+                                        db.rules[0].source_ip_cidr.retain(|x| x != &expired_node.cidr);
                                     }
                                     has_expired = true;
                                     println!("⏱️ [自动销毁] IP {} 授权过期，注册中心安全移除。", expired_node.cidr);
@@ -201,7 +204,7 @@ fn save_config(path: &str, config: &SingBoxConfig) {
 async fn report_ip_handler(
     State(ctx): State<Arc<AppContext>>,
     Path((secret, _user)): Path<(String, String)>,
-    uri: Uri, // 🌟 修复：捕获当前原始 URI 用于口令不对时的完美路由中转
+    uri: Uri, 
     headers: HeaderMap,
 ) -> Response {
     if secret != ctx.config.secret_key {
@@ -228,7 +231,7 @@ async fn report_ip_handler(
 async fn clear_ip_handler(
     State(ctx): State<Arc<AppContext>>,
     Path((clear_secret, target)): Path<(String, String)>,
-    uri: Uri, // 🌟 修复：同上，捕获 URI 用于错误时的动态伪装
+    uri: Uri, 
     headers: HeaderMap,
 ) -> Response {
     if clear_secret != ctx.config.clear_secret_key {
@@ -239,35 +242,36 @@ async fn clear_ip_handler(
         let _ = ctx.tx.send(RegistryCmd::ClearAll).await;
     }
 
-    Redirect::found(&format!("{}/", ctx.config.fake_website)).into_response()
+    // 🌟 修复：将 Redirect::found 改为 axum 认可的标准 Redirect::temporary
+    Redirect::temporary(&format!("{}/", ctx.config.fake_website)).into_response()
 }
 
-// 3️⃣ 接口：全局未匹配路由（全路径高保真拦截）
+// 3️⃣ 接口：全局未匹配路由
 async fn proxy_to_fake_handler(
     State(ctx): State<Arc<AppContext>>,
     method: Method,
-    uri: Uri, // 🌟 修复：获取全路径（如 /assets/style.css?v=1）
+    uri: Uri, 
     headers: HeaderMap,
     body: bytes::Bytes,
 ) -> Response {
     proxy_to_fake(&ctx, method, uri, headers, Some(body)).await
 }
 
-// 🌐 反向代理底层实现（🌟 真正的 1:1 克隆高保真反代）
+// 🌐 反向代理底层实现
 async fn proxy_to_fake(
     ctx: &AppContext, 
     method: Method, 
-    uri: Uri, // 接收请求的原始 URI
+    uri: Uri, 
     mut headers: HeaderMap, 
     body: Option<bytes::Bytes>
 ) -> Response {
-    // 🌟 修复：提取原始路径和查询参数，无缝拼接到伪装站域名后
     let base_fake_url = ctx.config.fake_website.trim_end_matches('/');
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("");
     let target_url = format!("{}{}", base_fake_url, path_and_query);
 
-    headers.remove("host"); // 必须移除 Host 标头让目标网站正常处理握手
+    headers.remove("host"); 
     
+    // 🌟 修复：得益于 reqwest 0.12 升级，这里的 Method 和 HeaderMap 格式已完美天然互通
     let mut req_builder = ctx.http_client.request(method, &target_url).headers(headers);
     if let Some(b) = body { if !b.is_empty() { req_builder = req_builder.body(b); } }
 
@@ -275,12 +279,14 @@ async fn proxy_to_fake(
         Ok(res) => {
             let mut resp_builder = Response::builder().status(res.status().as_u16());
             for (key, value) in res.headers().iter() {
-                // 彻底抹除能够追溯到本程序及 Cloudflare 中转的指纹标头
-                if key != "server" && key != "cf-ray" { resp_builder = resp_builder.header(key.as_str(), value); }
+                if key != "server" && key != "cf-ray" { 
+                    // 🌟 修复：利用 .clone()，完美将新版 reqwest HeaderValue 转为 axum HeaderValue
+                    resp_builder = resp_builder.header(key.as_str(), value.clone()); 
+                }
             }
             let bytes = res.bytes().await.unwrap_or_default();
             resp_builder.body(axum::body::Body::from(bytes)).unwrap()
         }
-        Err(_) => StatusCode::NOT_FOUND.into_response(), // 无法连接假网站时优雅抛出 404
+        Err(_) => StatusCode::NOT_FOUND.into_response(), 
     }
 }
