@@ -1,0 +1,17 @@
+# 🟢 普通口令：用于客户端上报 IP
+secret_key = "9d551f8885c9"
+
+# 🔴 专属清理口令：仅用于手动执行一键清空
+clear_secret_key = "d4f2ad1c"
+
+# 🎭 绝对防御兜底伪装网页
+fake_website = "https://2027168.xyz"
+
+# ⚡ sing-box 监控的本地规则集路径
+json_path = "/etc/sing-box/ip_whitelist.json"
+
+# 监听地址：由于配合 Argo 隧道，建议仅监听本地 127.0.0.1 确保安全
+listen_address = "127.0.0.1:8000"
+
+# ⏱️ IP 失效时间（单位：小时），支持修改为任意正整数
+expiration_hours = 24
